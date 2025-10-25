@@ -6,6 +6,8 @@ import base64
 import streamlit.components.v1 as components
 import html as html_mod
 import traceback
+import requests
+import json
 
 st.set_page_config(page_title="💬 나의 첫번째 챗봇", layout="wide")
 
@@ -89,16 +91,21 @@ chat_area = st.container()
 
 def extract_assistant_text_from_response(resp: Any) -> str:
     """
-    Extract assistant content from response object in a robust way.
-    Handles multiple SDK representations (dict-like or object-like).
+    Extract assistant content from response object/dict in a robust way.
     """
     try:
-        # common pattern: resp.choices[0].message.content or resp.choices[0].message['content']
-        choices = getattr(resp, "choices", None) or resp.get("choices", None)
+        # Try attribute-style choices
+        choices = getattr(resp, "choices", None)
+        if choices is None:
+            # Try dict-style
+            if isinstance(resp, dict):
+                choices = resp.get("choices", None)
+            else:
+                choices = None
         if not choices:
             return ""
         first_choice = choices[0]
-        # Try object-like access: first_choice.message.content
+        # first_choice might be an object with .message or a dict with 'message'
         msg = None
         if hasattr(first_choice, "message"):
             msg = getattr(first_choice, "message")
@@ -106,38 +113,36 @@ def extract_assistant_text_from_response(resp: Any) -> str:
             msg = first_choice.get("message", None)
 
         if msg is None:
-            # maybe text is directly in 'text' or 'message' string
+            # maybe 'text' field exists
             if isinstance(first_choice, dict):
                 return first_choice.get("text") or first_choice.get("message") or ""
             return str(first_choice)
 
         # If msg is dict
         if isinstance(msg, dict):
-            return msg.get("content", "") or msg.get("text", "")
-        # If msg is object with attribute 'content'
+            return msg.get("content", "") or msg.get("text", "") or ""
+        # If msg is object with attribute 'content' or 'text'
         if hasattr(msg, "content"):
             return getattr(msg, "content") or getattr(msg, "text", "") or ""
-        # fallback to str
+        if hasattr(msg, "text"):
+            return getattr(msg, "text", "")
+        # fallback
         return str(msg)
     except Exception:
-        # In case extraction fails, return empty and log
         st.error("응답 처리 중 예외가 발생했습니다. 콘솔 로그를 확인하세요.")
         st.write(traceback.format_exc())
         return ""
 
 def render_message_with_fallback(role: str, content: str, avatar_url: str = None):
     """
-    Try to render with st.chat_message(avatar=...), if not supported, fall back to custom HTML layout
-    that shows circular avatar + speech bubble using components.html.
+    Try st.chat_message with avatar; fallback to custom HTML block for max compatibility.
     """
     # First try st.chat_message with avatar param (works on Streamlit versions that support it)
     if role == "assistant":
         try:
-            # Some streamlit versions accept avatar as url/bytes; try and let it fail if unsupported
             st.chat_message("assistant", avatar=avatar_url).markdown(content)
             return
         except Exception:
-            # fall through to custom rendering
             pass
     elif role == "user":
         try:
@@ -146,13 +151,10 @@ def render_message_with_fallback(role: str, content: str, avatar_url: str = None
         except Exception:
             pass
 
-    # Fallback: render custom HTML block with circular avatar + message bubble.
-    # Escape the content to avoid XSS
+    # Fallback: custom HTML
     safe_content = html_mod.escape(content).replace("\n", "<br/>")
     avatar_src = avatar_url or ""
-    # Align differently for user vs assistant
     if role == "assistant":
-        # avatar left, bubble right
         html_block = f"""
         <div style="display:flex; align-items:flex-start; gap:8px; margin:8px 0;">
           <img src="{avatar_src}" style="width:36px; height:36px; border-radius:50%; object-fit:cover;"/>
@@ -162,7 +164,6 @@ def render_message_with_fallback(role: str, content: str, avatar_url: str = None
         </div>
         """
     else:
-        # user: bubble right, avatar right
         html_block = f"""
         <div style="display:flex; align-items:flex-start; gap:8px; margin:8px 0; justify-content:flex-end;">
           <div style="background:#e6f7ff; padding:8px 12px; border-radius:12px; max-width:80%; color:#111; text-align:left;">
@@ -171,7 +172,6 @@ def render_message_with_fallback(role: str, content: str, avatar_url: str = None
           <img src="{avatar_src}" style="width:36px; height:36px; border-radius:50%; object-fit:cover;"/>
         </div>
         """
-    # Use components.html to render raw HTML. Height will adjust; set a reasonable min-height to avoid clipping.
     components.html(html_block, height=120, scrolling=False)
 
 def render_messages():
@@ -179,7 +179,6 @@ def render_messages():
         for msg in st.session_state.messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            # For assistant messages use ai_avatar_data_url; for user messages you could show user's avatar or omit
             avatar_for_message = ai_avatar_data_url if role == "assistant" else ""
             render_message_with_fallback(role, content, avatar_for_message)
 
@@ -193,21 +192,58 @@ with send_col:
 # Render existing messages first
 render_messages()
 
+# Helper: fallback direct HTTP call using requests to avoid httpx header-encoding issues
+def call_openai_via_requests(api_key: str, messages_payload: List[Dict[str, str]], model: str = "gpt-3.5-turbo", temperature: float = 0.7, timeout: int = 60) -> Dict[str, Any]:
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        # Keep headers ASCII-only; do not include non-ascii values here
+    }
+    body = {
+        "model": model,
+        "messages": messages_payload,
+        "temperature": temperature,
+    }
+    resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()
+
 # Handle sending
 if send and user_input:
     # Append user message
     st.session_state.messages.append({"role": "user", "content": user_input})
     render_messages()
 
-    # Call OpenAI API
+    # Prepare payload
+    messages_payload = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages]
+
+    # Attempt normal client call first; if header encoding error occurs, fall back to requests
     try:
         with st.spinner("AI가 응답하는 중..."):
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
-                temperature=0.7,
-            )
-            assistant_text = extract_assistant_text_from_response(response)
+            try:
+                response = client.chat.completions.create(
+                    model="gpt-3.5-turbo",
+                    messages=messages_payload,
+                    temperature=0.7,
+                )
+                assistant_text = extract_assistant_text_from_response(response)
+            except Exception as e:
+                # Detect encoding-related error (ascii codec can't encode ...) or other httpx header issues
+                tb = traceback.format_exc()
+                if isinstance(e, UnicodeEncodeError) or "ascii" in str(e).lower() or "header" in str(e).lower() or "httpx" in tb.lower():
+                    # Fallback to requests
+                    try:
+                        resp_json = call_openai_via_requests(openai_api_key, messages_payload, model="gpt-3.5-turbo", temperature=0.7)
+                        assistant_text = extract_assistant_text_from_response(resp_json)
+                    except Exception as ex_req:
+                        st.error(f"폴백 요청도 실패했습니다: {ex_req}")
+                        st.write(traceback.format_exc())
+                        assistant_text = ""
+                else:
+                    # Other exception: re-raise to outer except
+                    raise
+
             if not assistant_text:
                 st.error("응답에서 텍스트를 추출할 수 없습니다. API 응답 구조를 확인해 주세요.")
             else:
