@@ -1,5 +1,5 @@
 import streamlit as st
-from openai import OpenAI
+from openai import OpenAI, APIError, AuthenticationError, RateLimitError
 
 # Configure the page
 st.set_page_config(page_title="💬 나의 첫번째 챗봇", page_icon="💬")
@@ -32,7 +32,11 @@ with st.sidebar:
     uploaded_file = st.file_uploader("Or upload avatar image", type=["png", "jpg", "jpeg"])
     if uploaded_file is not None:
         st.image(uploaded_file, caption="Avatar Preview", width=100)
+        # Note: Streamlit's chat_message accepts file objects for avatar parameter
         st.session_state.ai_avatar_url = uploaded_file
+    elif avatar_url == "":
+        # Clear avatar if URL is empty and no file uploaded
+        st.session_state.ai_avatar_url = None
     
     # New conversation button
     if st.button("🔄 New Conversation"):
@@ -58,19 +62,22 @@ for message in st.session_state.messages:
             st.markdown(message["content"])
     else:
         # Use avatar for assistant messages
-        avatar = st.session_state.ai_avatar_url if message["role"] == "assistant" else None
-        with st.chat_message("assistant", avatar=avatar):
+        with st.chat_message("assistant", avatar=st.session_state.ai_avatar_url):
             st.markdown(message["content"])
 
 # Chat input area
 if not openai_api_key:
     st.info("Please add your OpenAI API key in the sidebar to continue.", icon="🗝️")
 else:
+    # Initialize input key counter for clearing input after send
+    if "input_key" not in st.session_state:
+        st.session_state.input_key = 0
+    
     # Create two columns for input and send button
     col1, col2 = st.columns([5, 1])
     
     with col1:
-        user_input = st.text_input("Your message:", key="user_input", label_visibility="collapsed", placeholder="Type your message here...")
+        user_input = st.text_input("Your message:", key=f"user_input_{st.session_state.input_key}", label_visibility="collapsed", placeholder="Type your message here...")
     
     with col2:
         send_button = st.button("Send", type="primary", use_container_width=True)
@@ -99,13 +106,20 @@ else:
             # Add assistant message to session state
             st.session_state.messages.append({"role": "assistant", "content": assistant_message})
             
+            # Increment input key to clear the text input
+            st.session_state.input_key += 1
+            
             # Rerun to refresh the display
             st.rerun()
             
-        except Exception as e:
+        except (APIError, AuthenticationError, RateLimitError) as e:
             st.error(f"An error occurred while calling the OpenAI API: {str(e)}")
             st.info("Please check your API key and try again.")
             # Remove the user message that failed
+            st.session_state.messages.pop()
+        except Exception as e:
+            # Catch any other unexpected errors
+            st.error(f"An unexpected error occurred: {str(e)}")
             st.session_state.messages.pop()
     
     elif send_button and not user_input:
