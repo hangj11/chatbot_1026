@@ -1,10 +1,11 @@
 import streamlit as st
 from openai import OpenAI
-from typing import List, Dict
+from typing import List, Dict, Any
 import time
 import base64
 import streamlit.components.v1 as components
 import html as html_mod
+import traceback
 
 st.set_page_config(page_title="💬 나의 첫번째 챗봇", layout="wide")
 
@@ -85,6 +86,44 @@ if "messages" not in st.session_state or not persist_history:
 
 # Chat display area
 chat_area = st.container()
+
+def extract_assistant_text_from_response(resp: Any) -> str:
+    """
+    Extract assistant content from response object in a robust way.
+    Handles multiple SDK representations (dict-like or object-like).
+    """
+    try:
+        # common pattern: resp.choices[0].message.content or resp.choices[0].message['content']
+        choices = getattr(resp, "choices", None) or resp.get("choices", None)
+        if not choices:
+            return ""
+        first_choice = choices[0]
+        # Try object-like access: first_choice.message.content
+        msg = None
+        if hasattr(first_choice, "message"):
+            msg = getattr(first_choice, "message")
+        elif isinstance(first_choice, dict):
+            msg = first_choice.get("message", None)
+
+        if msg is None:
+            # maybe text is directly in 'text' or 'message' string
+            if isinstance(first_choice, dict):
+                return first_choice.get("text") or first_choice.get("message") or ""
+            return str(first_choice)
+
+        # If msg is dict
+        if isinstance(msg, dict):
+            return msg.get("content", "") or msg.get("text", "")
+        # If msg is object with attribute 'content'
+        if hasattr(msg, "content"):
+            return getattr(msg, "content") or getattr(msg, "text", "") or ""
+        # fallback to str
+        return str(msg)
+    except Exception:
+        # In case extraction fails, return empty and log
+        st.error("응답 처리 중 예외가 발생했습니다. 콘솔 로그를 확인하세요.")
+        st.write(traceback.format_exc())
+        return ""
 
 def render_message_with_fallback(role: str, content: str, avatar_url: str = None):
     """
@@ -168,8 +207,11 @@ if send and user_input:
                 messages=[{"role": m["role"], "content": m["content"]} for m in st.session_state.messages],
                 temperature=0.7,
             )
-            assistant_text = response.choices[0].message["content"]
-            st.session_state.messages.append({"role": "assistant", "content": assistant_text})
+            assistant_text = extract_assistant_text_from_response(response)
+            if not assistant_text:
+                st.error("응답에서 텍스트를 추출할 수 없습니다. API 응답 구조를 확인해 주세요.")
+            else:
+                st.session_state.messages.append({"role": "assistant", "content": assistant_text})
             # small pause to ensure UI updates
             time.sleep(0.1)
             render_messages()
@@ -177,6 +219,7 @@ if send and user_input:
             st.session_state["user_input"] = ""
     except Exception as e:
         st.error(f"API 호출 중 오류가 발생했습니다: {e}")
+        st.write(traceback.format_exc())
 
 if not st.session_state.messages:
     st.info("새로운 대화를 시작하세요. 메시지를 입력하고 '보내기'를 누르세요.")
